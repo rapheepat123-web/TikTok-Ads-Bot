@@ -223,7 +223,7 @@ async function generateVideo(script, avatarId = null) {
 }
 
 async function waitForVideo(videoId) {
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 60; i++) {
     await sleep(10000);
     try {
       const response = await axios.get(
