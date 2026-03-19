@@ -1,328 +1,506 @@
-require("dotenv").config();
-const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
-const cheerio = require("cheerio");
-const cron = require("node-cron");
-const fs = require("fs");
+[3/19/2026 6:26 PM] X: require(“dotenv”).config();
+const TelegramBot = require(“node-telegram-bot-api”);
+const axios = require(“axios”);
+const fs = require(“fs”);
 
 // ===== CONFIG =====
-const BOT_TOKEN = process.env.BOT_TOKEN;           // ใส่ใน .env
-const CHAT_ID = process.env.CHAT_ID;               // ใส่ใน .env
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // ใส่ใน .env
-const CHECK_INTERVAL = "*/15 * * * *";             // ทุก 15 นาที
-const SEEN_FILE = "./seen_articles.json";
-
-const SOURCES = [
-  {
-    name: "TikTok Business Blog",
-    url: "https://www.tiktok.com/business/en-US/blog",
-    type: "tiktok-blog",
-  },
-  {
-    name: "TikTok For Business Newsroom",
-    url: "https://newsroom.tiktok.com/en-us",
-    type: "newsroom",
-  },
-];
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const HEYGEN_API_KEY = process.env.HEYGEN_API_KEY;
 
 // ===== BOT SETUP =====
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// ===== SEEN ARTICLES (ป้องกันแจ้งซ้ำ) =====
-function loadSeen() {
-  if (!fs.existsSync(SEEN_FILE)) return new Set();
-  const data = JSON.parse(fs.readFileSync(SEEN_FILE, "utf-8"));
-  return new Set(data);
-}
-
-function saveSeen(seen) {
-  fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]), "utf-8");
-}
-
-// ===== SCRAPER: ดึงรายชื่อบทความ =====
-async function fetchArticleList(source) {
-  try {
-    const { data } = await axios.get(source.url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-      },
-      timeout: 15000,
-    });
-
-    const $ = cheerio.load(data);
-    const articles = [];
-
-    if (source.type === "tiktok-blog") {
-      $("a").each((_, el) => {
-        const href = $(el).attr("href") || "";
-        const title = $(el).text().trim();
-        if (
-          href.includes("/blog/") &&
-          title.length > 20 &&
-          !articles.find((a) => a.url === href)
-        ) {
-          articles.push({
-            title,
-            url: href.startsWith("http") ? href : `https://www.tiktok.com${href}`,
-            source: source.name,
-          });
-        }
-      });
-    } else if (source.type === "newsroom") {
-      $("article, .article-card, .post-card").each((_, el) => {
-        const title =
-          $(el).find("h2, h3, .title").first().text().trim() ||
-          $(el).find("a").first().text().trim();
-        const href = $(el).find("a").first().attr("href") || "";
-        if (title.length > 10 && href) {
-          articles.push({
-            title,
-            url: href.startsWith("http") ? href : `https://newsroom.tiktok.com${href}`,
-            source: source.name,
-          });
-        }
-      });
-    }
-
-    return articles.slice(0, 10);
-  } catch (err) {
-    console.error(`❌ Error fetching ${source.name}:`, err.message);
-    return [];
-  }
-}
-
-// ===== SCRAPER: ดึงเนื้อหาบทความ =====
-async function fetchArticleContent(url) {
-  try {
-    const { data } = await axios.get(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-      },
-      timeout: 15000,
-    });
-
-    const $ = cheerio.load(data);
-
-    // ลบ script, style, nav, footer ออก
-    $("script, style, nav, footer, header, .cookie-banner, .popup").remove();
-
-    // ดึงเนื้อหาหลัก
-    const content =
-      $("article").text() ||
-      $("main").text() ||
-      $(".blog-content, .post-content, .article-content").text() ||
-      $("body").text();
-
-    // ทำความสะอาดข้อความ
-    return content.replace(/\s+/g, " ").trim().slice(0, 4000);
-  } catch (err) {
-    console.error(`❌ Error fetching article content:`, err.message);
-    return null;
-  }
-}
-
-// ===== AI SUMMARY ด้วย Claude =====
-async function summarizeWithClaude(title, content, url) {
-  try {
-    const response = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [
-          {
-            role: "user",
-            content: `คุณคือผู้เชี่ยวชาญด้าน TikTok Ads และการตลาดดิจิทัล
-
-บทความนี้มาจาก TikTok Business:
-ชื่อ: ${title}
-เนื้อหา: ${content}
-
-กรุณาสรุปเป็นภาษาไทย ในรูปแบบนี้:
-
-📋 สรุปการอัพเดท:
-(สรุปสั้นๆ 2-3 ประโยค ว่ามีการเปลี่ยนแปลงอะไร)
-
-🎯 ผลกระทบต่อผู้ลงโฆษณา:
-(บอกว่ากระทบกับแคมเปญหรือการทำโฆษณาอย่างไร)
-
-✅ วิธีรับมือ/แก้ปัญหา:
-(แนะนำ 2-3 ข้อ ว่าควรปรับกลยุทธ์หรือตั้งค่าโฆษณาอย่างไร)
-
-⚠️ สิ่งที่ต้องระวัง:
-(เตือนถึงสิ่งที่อาจพลาดหรือทำให้โฆษณาได้รับผลกระทบ)`,
-          },
-        ],
-      },
-      {
-        headers: {
-          "x-api-key": ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
-        },
-        timeout: 30000,
-      }
-    );
-
-    return response.data.content[0].text;
-  } catch (err) {
-    console.error("❌ Claude API error:", err.message);
-    return null;
-  }
-}
-
-// ===== ส่งข้อความยาวโดยแบ่ง chunk =====
-async function sendLongMessage(chatId, text, options = {}) {
-  const MAX_LENGTH = 4000;
-  if (text.length <= MAX_LENGTH) {
-    await bot.sendMessage(chatId, text, options);
-    return;
-  }
-  const parts = [];
-  let remaining = text;
-  while (remaining.length > 0) {
-    parts.push(remaining.slice(0, MAX_LENGTH));
-    remaining = remaining.slice(MAX_LENGTH);
-  }
-  for (const part of parts) {
-    await bot.sendMessage(chatId, part, options);
-    await sleep(500);
-  }
-}
-
-// ===== CHECK & NOTIFY =====
-async function checkAndNotify(targetChatId = CHAT_ID) {
-  console.log("🔍 กำลังตรวจสอบอัพเดทจาก TikTok Business...");
-  const seen = loadSeen();
-  let newCount = 0;
-
-  for (const source of SOURCES) {
-    const articles = await fetchArticleList(source);
-
-    for (const article of articles) {
-      const key = article.url;
-      if (!seen.has(key)) {
-        seen.add(key);
-        newCount++;
-
-        // แจ้งว่ากำลังประมวลผล
-        await bot.sendMessage(
-          targetChatId,
-          `⏳ กำลังวิเคราะห์บทความใหม่จาก ${article.source}...`
-        );
-
-        // ดึงเนื้อหาบทความ
-        const content = await fetchArticleContent(article.url);
-
-        let summarySection = "";
-        if (content && ANTHROPIC_API_KEY) {
-          const summary = await summarizeWithClaude(article.title, content, article.url);
-          if (summary) {
-            summarySection = `\n\n${summary}`;
-          }
-        }
-
-        const msg =
-          `🚨 *อัพเดทใหม่จาก TikTok Ads!*\n\n` +
-          `📌 *${escapeMarkdown(article.title)}*\n` +
-          `🏷️ แหล่งที่มา: ${escapeMarkdown(article.source)}\n` +
-          `🔗 [อ่านบทความเต็ม](${article.url})` +
-          `${summarySection ? escapeMarkdown(summarySection) : "\n\n_(ไม่สามารถดึงเนื้อหาได้ กรุณาอ่านจากลิงก์)_"}`;
-
-        await sendLongMessage(targetChatId, msg, {
-          parse_mode: "Markdown",
-          disable_web_page_preview: false,
-        });
-
-        await sleep(2000);
-      }
-    }
-  }
-
-  saveSeen(seen);
-
-  if (newCount === 0) {
-    console.log("✅ ไม่มีอัพเดทใหม่ในขณะนี้");
-    return false;
-  } else {
-    console.log(`✅ แจ้งเตือน ${newCount} บทความใหม่`);
-    return true;
-  }
-}
-
-// ===== HELPER =====
-function escapeMarkdown(text) {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, "\\$&");
-}
-
 function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
+return new Promise((res) => setTimeout(res, ms));
+}
+
+async function sendLongMessage(chatId, text, options = {}) {
+const MAX_LENGTH = 4000;
+if (text.length <= MAX_LENGTH) {
+await bot.sendMessage(chatId, text, options);
+return;
+}
+let remaining = text;
+while (remaining.length > 0) {
+await bot.sendMessage(chatId, remaining.slice(0, MAX_LENGTH), options);
+remaining = remaining.slice(MAX_LENGTH);
+await sleep(500);
+}
+}
+
+// ===== AI: ถาม-ตอบครบทุกเรื่อง =====
+async function askClaude(question) {
+try {
+const response = await axios.post(
+“https://api.anthropic.com/v1/messages”,
+{
+model: “claude-sonnet-4-20250514”,
+max_tokens: 2000,
+messages: [
+{
+role: “user”,
+content: `คุณคือ AI ผู้เชี่ยวชาญครบจบ มีความรู้ลึกในเรื่องต่อไปนี้:
+
+🎯 TikTok Ads:
+
+- การตั้งค่าและบริหารแคมเปญทุกประเภท
+- นโยบายโฆษณาและสาเหตุโฆษณาโดนระงับ
+- ขั้นตอนยื่นอุทธรณ์โฆษณาอย่างละเอียด
+- เพิ่มประสิทธิภาพ CTR, CPM, ROAS
+- Spark Ads, TopView, In-Feed Ads
+
+🎥 การสร้างวิดีโอ AI:
+
+- สร้างวิดีโอโฆษณาด้วย HeyGen
+- Clone เสียงตัวเองและทำ Lip Sync
+- สร้าง Avatar หน้าเหมือนตัวเอง
+- เจนวิดีโอโปรโมทสินค้าและเกม
+- เทคนิคทำวิดีโอให้ดูสมจริง
+
+🎨 การเจนรูป AI:
+
+- Prompt เทคนิคทำรูปให้สมจริง
+- เจนรูปสินค้าและโฆษณา
+- เจนรูปโปรโมทเกม
+- สไตล์ต่างๆ สำหรับ Social Media
+
+🎮 วิดีโอเกม:
+
+- แนะนำเกมทุกประเภท
+- เทคนิคและกลยุทธ์การเล่น
+- โฆษณาเกมบน TikTok
+- สร้างคอนเทนต์เกม
+
+กฎการตอบ:
+
+1. ตอบเป็นภาษาไทยเสมอ
+1. ตอบละเอียดเป็นขั้นตอนชัดเจน
+1. ถ้าไม่เข้าใจคำถามให้ถามกลับทันที
+1. แนะนำขั้นตอนต่อไปให้เสมอ
+1. ถ้าถามเรื่องวิธีทำอะไร ให้สอนทีละขั้นตอนเลย
+
+คำถาม: ${question}`,
+},
+],
+},
+{
+headers: {
+“x-api-key”: ANTHROPIC_API_KEY,
+“anthropic-version”: “2023-06-01”,
+“Content-Type”: “application/json”,
+},
+timeout: 30000,
+}
+);
+return response.data.content[0].text;
+} catch (err) {
+console.error(“❌ Claude error:”, err.message);
+return null;
+}
+}
+
+// ===== AI: เขียน Script วิดีโอ =====
+async function generateScript(prompt) {
+try {
+const response = await axios.post(
+“https://api.anthropic.com/v1/messages”,
+{
+model: “claude-sonnet-4-20250514”,
+max_tokens: 1500,
+messages: [
+{
+role: “user”,
+content: `คุณคือผู้เชี่ยวชาญด้านการเขียน Script วิดีโอสำหรับ TikTok และ Social Media
+
+สร้าง Script วิดีโอจากข้อมูลนี้: ${prompt}
+
+รูปแบบ:
+🎬 *Script วิดีโอ*
+
+⏱️ Hook (0-3 วินาที):
+[ประโยคเปิดดึงดูดทันที]
+
+📢 เนื้อหาหลัก (3-25 วินาที):
+[นำเสนอสินค้า/เกม/บริการ จุดเด่น ประโยชน์]
+
+🎯 CTA (25-30 วินาที):
+[กระตุ้นให้ดำเนินการ]
+
+💡 เทคนิคการถ่ายทำ:
+[แนะนำมุมกล้อง เอฟเฟกต์ เพลง]`,
+},
+],
+},
+{
+headers: {
+“x-api-key”: ANTHROPIC_API_KEY,
+“anthropic-version”: “2023-06-01”,
+“Content-Type”: “application/json”,
+},
+timeout: 30000,
+}
+);
+return response.data.content[0].text;
+} catch (err) {
+console.error(“❌ Script error:”, err.message);
+return null;
+}
+}
+
+// ===== AI: เจนรูปด้วย DALL-E =====
+async function generateImage(prompt) {
+try {
+const enhancedPrompt = await askClaude(
+แปลง Prompt นี้เป็นภาษาอังกฤษสำหรับ DALL-E ให้รูปดูสมจริงมาก เหมาะกับโฆษณา Social Media: "${prompt}". ตอบแค่ Prompt ภาษาอังกฤษเท่านั้น ไม่ต้องอธิบาย
+);
+const response = await axios.post(
+  "https://api.openai.com/v1/images/generations",
+  {
+    model: "dall-e-3",
+    prompt: enhancedPrompt || prompt,
+    n: 1,
+    size: "1024x1024",
+    quality: "hd",
+    style: "natural",
+  },
+  {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    timeout: 60000,
+  }
+);
+return response.data.data[0].url;
+
+} catch (err) {
+console.error(“❌ DALL-E error:”, err.message);
+return null;
+}
+}
+
+// ===== AI: เจนวิดีโอด้วย HeyGen =====
+async function generateVideo(script, avatarId = null) {
+try {
+if (!avatarId) {
+const avatarsRes = await axios.get(“https://api.heygen.
+[3/19/2026 6:26 PM] X: com/v2/avatars”, {
+headers: { “x-api-key”: HEYGEN_API_KEY },
+});
+const avatars = avatarsRes.data.data.avatars;
+avatarId = avatars[0]?.avatar_id;
+}
+const response = await axios.post(
+  "https://api.heygen.com/v2/video/generate",
+  {
+    video_inputs: [
+      {
+        character: {
+          type: "avatar",
+          avatar_id: avatarId,
+          avatar_style: "normal",
+        },
+        voice: {
+          type: "text",
+          input_text: script,
+          voice_id: "th-TH-NiwatNeural",
+        },
+      },
+    ],
+    dimension: { width: 1080, height: 1920 },
+    aspect_ratio: "9:16",
+  },
+  {
+    headers: {
+      "x-api-key": HEYGEN_API_KEY,
+      "Content-Type": "application/json",
+    },
+    timeout: 30000,
+  }
+);
+return response.data.data.video_id;
+
+} catch (err) {
+console.error(“❌ HeyGen error:”, err.message);
+return null;
+}
+}
+
+async function waitForVideo(videoId) {
+for (let i = 0; i < 30; i++) {
+await sleep(10000);
+try {
+const response = await axios.get(
+https://api.heygen.com/v1/video_status.get?video_id=${videoId},
+{ headers: { “x-api-key”: HEYGEN_API_KEY } }
+);
+const status = response.data.data;
+if (status.status === “completed”) return status.video_url;
+if (status.status === “failed”) return null;
+} catch (err) {
+console.error(“❌ Video status error:”, err.message);
+}
+}
+return null;
+}
+
+// ===== AI: วิเคราะห์รูปภาพ =====
+async function analyzeImage(imageBase64, caption) {
+try {
+const response = await axios.post(
+“https://api.anthropic.com/v1/messages”,
+{
+model: “claude-sonnet-4-20250514”,
+max_tokens: 1500,
+messages: [
+{
+role: “user”,
+content: [
+{
+type: “image”,
+source: { type: “base64”, media_type: “image/jpeg”, data: imageBase64 },
+},
+{
+type: “text”,
+text: คุณคือ AI ผู้เชี่ยวชาญครบจบ วิเคราะห์รูปนี้เป็นภาษาไทยละเอียดทุกขั้นตอน ${caption ? `คำถามเพิ่มเติม: ${caption} : “”}
+
+ถ้าเป็น Error/แจ้งเตือน TikTok Ads:
+
+1. บอกว่าเกิดอะไรขึ้น
+1. สาเหตุที่เป็นไปได้
+1. วิธีแก้ไขทีละขั้นตอน
+1. วิธียื่นอุทธรณ์ (ถ้าจำเป็น)
+
+ถ้าเป็นสถิติ/ผลแคมเปญ:
+
+1. สรุปผลที่เห็น
+1. จุดที่ดีและควรปรับปรุง
+1. คำแนะนำเพิ่มประสิทธิภาพ
+
+ถ้าเป็นเรื่องอื่น:
+วิเคราะห์และให้คำแนะนำที่เป็นประโยชน์`,
+},
+],
+},
+],
+},
+{
+headers: {
+“x-api-key”: ANTHROPIC_API_KEY,
+“anthropic-version”: “2023-06-01”,
+“Content-Type”: “application/json”,
+},
+timeout: 30000,
+}
+);
+return response.data.content[0].text;
+} catch (err) {
+console.error(“❌ Image analysis error:”, err.message);
+return null;
+}
 }
 
 // ===== COMMANDS =====
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    `👋 สวัสดีครับ! ผมคือ *TikTok Ads Update Bot* 🤖\n\n` +
-      `ผมจะคอยติดตามข่าวสารจาก TikTok Business แล้วสรุป\n` +
-      `พร้อมแนะนำวิธีรับมือให้อัตโนมัติครับ\n\n` +
-      `📋 *คำสั่งที่ใช้ได้:*\n` +
-      `/check \\- ตรวจสอบอัพเดทตอนนี้เลย\n` +
-      `/status \\- ดูสถานะบอท\n` +
-      `/help \\- แสดงคำสั่งทั้งหมด\n\n` +
-      `⏰ บอทจะแจ้งเตือนอัตโนมัติทุกวัน เวลา 09:00 น\\.`,
-    { parse_mode: "MarkdownV2" }
-  );
+bot.onText(//start/, (msg) => {
+bot.sendMessage(
+msg.chat.id,
+👋 สวัสดีครับ! ผมคือ *AI Expert Bot* 🤖\n\n +
+💬 *ถามผมได้ทุกเรื่องเลยครับ!*\n\n +
+📋 *คำสั่ง:*\n +
+/script - เขียน Script วิดีโอ\n +
+/image - เจนรูปสมจริง\n +
+/video - เจนวิดีโอ AI\n +
+/appeal - วิธียื่นอุทธรณ์โฆษณา\n +
+/clone - วิธี Clone เสียงตัวเอง\n +
+/help - ดูทุกคำสั่ง\n\n +
+📸 *ส่งรูปหน้าจอมาวิเคราะห์ได้เลยครับ*\n\n +
+🎯 *ตัวอย่างถามได้เลย:*\n +
+"ยื่นอุทธรณ์ยังไง"\n +
+"สร้างวิดีโอโปรโมทเกมยังไง"\n +
+"CPM สูงเกินแก้ยังไง",
+{ parse_mode: “Markdown” }
+);
 });
 
-bot.onText(/\/check/, async (msg) => {
-  await bot.sendMessage(msg.chat.id, "🔍 กำลังตรวจสอบอัพเดทใหม่จาก TikTok Business...");
-  const hasNew = await checkAndNotify(msg.chat.id);
-  if (!hasNew) {
-    await bot.sendMessage(msg.chat.id, "✅ ยังไม่มีอัพเดทใหม่ในขณะนี้ครับ");
-  }
+bot.onText(//help/, (msg) => {
+bot.sendMessage(
+msg.chat.id,
+📋 *คำสั่งทั้งหมด:*\n\n +
+*/script* [รายละเอียด]\n +
+ตัวอย่าง: /script ขายครีมบำรุงผิว ผู้หญิง 25-35 ปี\n\n +
+*/image* [รายละเอียด]\n +
+ตัวอย่าง: /image ครีมบำรุงผิว พื้นหลังขาว สมจริง\n\n +
+*/video* [รายละเอียด]\n +
+ตัวอย่าง: /video โปรโมทเกม ROV สไตล์ตื่นเต้น 30 วิ\n\n +
+*/appeal* - ขั้นตอนยื่นอุทธรณ์โฆษณา\n\n +
+*/clone* - วิธี Clone เสียงตัวเองใน HeyGen\n\n +
+📸 *ส่งรูปมาวิเคราะห์ได้เลยครับ*\n\n +
+💬 *หรือพิมพ์ถามได้เลยทุกเรื่อง*,
+{ parse_mode: “Markdown” }
+);
 });
 
-bot.onText(/\/status/, (msg) => {
-  const seen = loadSeen();
-  const hasKey = !!ANTHROPIC_API_KEY;
-  bot.sendMessage(
-    msg.chat.id,
-    `🤖 *สถานะบอท*\n\n` +
-      `✅ ออนไลน์อยู่\n` +
-      `🧠 AI สรุปบทความ: ${hasKey ? "✅ เปิดใช้งาน" : "❌ ยังไม่ได้ตั้งค่า ANTHROPIC\\_API\\_KEY"}\n` +
-      `📰 บทความที่ติดตามแล้ว: ${seen.size} รายการ\n` +
-      `⏰ ตรวจสอบอัตโนมัติ: ทุกวัน 09:00 น\\.`,
-    { parse_mode: "MarkdownV2" }
-  );
+bot.onText(//appeal/, async (msg) => {
+await bot.sendMessage(msg.chat.id, “⏳ กำลังเตรียมข้อมูลการยื่นอุทธรณ์…”);
+const answer = await askClaude(“อธิบายขั้นตอนการยื่นอุทธรณ์โฆษณา TikTok Ads ที่โดนระงับหรือปฏิเสธ อย่างละเอียดทีละขั้นตอน พร้อมเทคนิคที่ช่วยให้อุทธรณ์สำเร็จ และสิ่งที่ควรเขียนในคำอุทธรณ์”);
+if (answer) {
+await sendLongMessage(msg.chat.id, 📋 *วิธียื่นอุทธรณ์โฆษณา TikTok*\n\n${answer}, { parse_mode: “Markdown” });
+} else {
+await bot.sendMessage(msg.chat.id, “❌ ไม่สามารถดึงข้อมูลได้ครับ ลองใหม่อีกครั้ง”);
+}
 });
 
-bot.onText(/\/help/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    `📋 *คำสั่งทั้งหมด:*\n\n` +
-      `/start \\- เริ่มต้นใช้งาน\n` +
-      `/check \\- ตรวจสอบอัพเดททันที\n` +
-      `/status \\- ดูสถานะบอท\n` +
-      `/help \\- แสดงคำสั่งทั้งหมด`,
-    { parse_mode: "MarkdownV2" }
-  );
+bot.onText(//clone/, async (msg) => {
+await bot.sendMessage(msg.chat.
+[3/19/2026 6:26 PM] X: id, “⏳ กำลังเตรียมข้อมูล Clone เสียง…”);
+const answer = await askClaude(“อธิบายขั้นตอนการ Clone เสียงตัวเองใน HeyGen อย่างละเอียดทีละขั้นตอน พร้อมเทคนิคทำให้เสียงสมจริงที่สุด และวิธีนำไปใช้สร้างวิดีโอ”);
+if (answer) {
+await sendLongMessage(msg.chat.id, 🎙️ *วิธี Clone เสียงตัวเองใน HeyGen*\n\n${answer}, { parse_mode: “Markdown” });
+} else {
+await bot.sendMessage(msg.chat.id, “❌ ไม่สามารถดึงข้อมูลได้ครับ ลองใหม่อีกครั้ง”);
+}
 });
 
-// ===== CRON JOB (ทุกวัน 09:00 น.) =====
-cron.schedule(CHECK_INTERVAL, () => {
-  console.log("⏰ Cron job: ตรวจสอบอัพเดทประจำวัน");
-  checkAndNotify();
-}, {
-  timezone: "Asia/Bangkok",
+bot.onText(//script (.+)/, async (msg, match) => {
+const prompt = match[1];
+await bot.sendMessage(msg.chat.id, “✍️ กำลังเขียน Script ให้…”);
+const script = await generateScript(prompt);
+if (script) {
+await sendLongMessage(msg.chat.id, script, { parse_mode: “Markdown” });
+} else {
+await bot.sendMessage(msg.chat.id, “❌ ไม่สามารถเขียน Script ได้ครับ ลองใหม่อีกครั้ง”);
+}
+});
+
+bot.onText(//script$/, (msg) => {
+bot.sendMessage(msg.chat.id,
+📝 กรุณาใส่รายละเอียดด้วยครับ\n\nตัวอย่าง:\n +
+/script ขายครีมบำรุงผิว กลุ่มเป้าหมายผู้หญิง 25-35 ปี\n +
+/script โปรโมทเกม ROV สไตล์ตื่นเต้น
+);
+});
+
+bot.onText(//image (.+)/, async (msg, match) => {
+const prompt = match[1];
+await bot.sendMessage(msg.chat.id, “🎨 กำลังเจนรูปให้ รอสักครู่…”);
+const imageUrl = await generateImage(prompt);
+if (imageUrl) {
+await bot.sendPhoto(msg.chat.id, imageUrl, { caption: ✅ รูปที่เจนจาก: "${prompt}" });
+} else {
+await bot.sendMessage(msg.chat.id, “❌ ไม่สามารถเจนรูปได้ครับ ลองใหม่อีกครั้ง”);
+}
+});
+
+bot.onText(//image$/, (msg) => {
+bot.sendMessage(msg.chat.id,
+🎨 กรุณาใส่รายละเอียดด้วยครับ\n\nตัวอย่าง:\n +
+/image ครีมบำรุงผิว พื้นหลังขาว สมจริง\n +
+/image โปรโมทเกม ROV กราฟิกสวยงาม
+);
+});
+
+bot.onText(//video (.+)/, async (msg, match) => {
+const prompt = match[1];
+const chatId = msg.chat.id;
+
+await bot.sendMessage(chatId, “✍️ กำลังเขียน Script…”);
+const script = await generateScript(prompt);
+if (!script) {
+await bot.sendMessage(chatId, “❌ ไม่สามารถเขียน Script ได้ครับ”);
+return;
+}
+
+await sendLongMessage(chatId, 📝 *Script ที่จะใช้:*\n\n${script}, { parse_mode: “Markdown” });
+await bot.sendMessage(chatId, “🎥 กำลังสร้างวิดีโอ รอประมาณ 2-5 นาทีครับ…”);
+
+const videoId = await generateVideo(
+script.replace(/[*_#[]()]/g, “”).slice(0, 500)
+);
+
+if (!videoId) {
+await bot.sendMessage(chatId, “❌ ไม่สามารถสร้างวิดีโอได้ครับ ลองใหม่อีกครั้ง”);
+return;
+}
+
+await bot.sendMessage(chatId, “⏳ กำลังประมวลผลวิดีโอ…”);
+const videoUrl = await waitForVideo(videoId);
+
+if (videoUrl) {
+await bot.sendVideo(chatId, videoUrl, { caption: ✅ วิดีโอจาก: "${prompt}" });
+} else {
+await bot.sendMessage(chatId, `❌ วิดีโอใช้เวลานานเกินไปครับ ลองใหม่อีกครั้ง`);
+}
+});
+
+bot.onText(//video$/, (msg) => {
+bot.sendMessage(msg.chat.id,
+🎥 กรุณาใส่รายละเอียดด้วยครับ\n\nตัวอย่าง:\n +
+/video ขายครีมบำรุงผิว กลุ่มเป้าหมายผู้หญิง 25-35 ปี\n +
+/video โปรโมทเกม ROV สไตล์ตื่นเต้น 30 วินาที
+);
+});
+
+bot.onText(//status/, (msg) => {
+bot.sendMessage(
+msg.chat.id,
+🤖 *สถานะบอท*\n\n +
+✅ ออนไลน์อยู่\n +
+🧠 Claude AI: ${ANTHROPIC_API_KEY ? "✅" : "❌"}\n +
+🎨 DALL-E: ${OPENAI_API_KEY ? "✅" : "❌"}\n +
+🎥 HeyGen: ${HEYGEN_API_KEY ? "✅" : "❌"},
+{ parse_mode: “Markdown” }
+);
+});
+
+// ===== รับข้อความทั่วไป =====
+bot.on(“message”, async (msg) => {
+const text = msg.text || “”;
+const chatId = msg.chat.id;
+if (text.startsWith(”/”)) return;
+if (text.length < 2) return;
+
+console.log(`💬 คำถาม: ${text}`);
+const typing = await bot.sendMessage(chatId, “🤔 กำลังวิเคราะห์…”);
+
+const answer = await askClaude(text);
+
+try { await bot.deleteMessage(chatId, typing.message_id); } catch (e) {}
+
+if (answer) {
+await sendLongMessage(chatId, 🤖 *AI Expert:*\n\n${answer}, { parse_mode: “Markdown” });
+} else {
+await bot.sendMessage(chatId, “❌ ขออภัยครับ เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะครับ”);
+}
+});
+
+// ===== รับรูปภาพ =====
+bot.on(“photo”, async (msg) => {
+const chatId = msg.chat.id;
+const caption = msg.caption || “”;
+await bot.sendMessage(chatId, “📸 ได้รับรูปแล้ว กำลังวิเคราะห์…”);
+try {
+const photo = msg.photo[msg.photo.length - 1];
+const fileInfo = await bot.getFile(photo.file_id);
+const fileUrl = https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path};
+const imageResponse = await axios.
+[3/19/2026 6:26 PM] X: get(fileUrl, { responseType: “arraybuffer” });
+const imageBase64 = Buffer.from(imageResponse.data).toString(“base64”);
+const analysis = await analyzeImage(imageBase64, caption);
+if (analysis) {
+await sendLongMessage(chatId, 🔍 *ผลการวิเคราะห์:*\n\n${analysis}, { parse_mode: “Markdown” });
+} else {
+await bot.sendMessage(chatId, “❌ ไม่สามารถวิเคราะห์รูปได้ครับ ลองใหม่อีกครั้ง”);
+}
+} catch (err) {
+console.error(“❌ Photo error:”, err.message);
+await bot.sendMessage(chatId, “❌ เกิดข้อผิดพลาด ลองใหม่อีกครั้งนะครับ”);
+}
 });
 
 // ===== START =====
-console.log("🚀 TikTok Ads Update Bot เริ่มทำงานแล้ว!");
-console.log(`⏰ จะตรวจสอบอัตโนมัติตาม cron: ${CHECK_INTERVAL} (Asia/Bangkok)`);
-if (!ANTHROPIC_API_KEY) {
-  console.warn("⚠️  ไม่พบ ANTHROPIC_API_KEY — บอทจะทำงานได้ แต่จะไม่สรุปบทความด้วย AI");
-}
-checkAndNotify(); // ตรวจสอบทันทีตอน start
+console.log(“🚀 AI Expert Bot เริ่มทำงานแล้ว!”);
+console.log(`🧠 Claude: ${ANTHROPIC_API_KEY ? "✅" : "❌"}`);
+console.log(`🎨 DALL-E: ${OPENAI_API_KEY ? "✅" : "❌"}`);
+console.log(`🎥 HeyGen: ${HEYGEN_API_KEY ? "✅" : "❌"}`);
